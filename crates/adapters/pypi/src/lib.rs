@@ -26,11 +26,12 @@
 //! No support yet (file an issue if you need them):
 //! `Pipfile.lock`, `pdm.lock`, `pyproject.toml` `[tool.uv]` sections.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use installguard_core::adapter::{AdapterError, LockfileAdapter};
 use installguard_core::dependency::{Ecosystem, Integrity, ResolvedDependency, Source};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Default)]
 pub struct PypiAdapter;
@@ -461,20 +462,20 @@ fn classify_poetry_source(source: Option<&PoetrySource>) -> Source {
 /// version markers (`requests>=2`) or extras (`requests[security]`); we
 /// strip both to recover the bare distribution name.
 fn extract_poetry_direct_names(pyproject_raw: &str) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = BTreeSet::new();
     let Ok(pyproject) = toml::from_str::<PoetryPyproject>(pyproject_raw) else {
         return out;
     };
 
     // [tool.poetry.dependencies] and [tool.poetry.group.*.dependencies]
     if let Some(poetry) = pyproject.tool.and_then(|tool| tool.poetry) {
-        for name in poetry.dependencies.keys() {
+        for name in &poetry.dependencies {
             if name != "python" {
                 out.insert(normalise_pypi_name(name));
             }
         }
         for group in poetry.group.values() {
-            for name in group.dependencies.keys() {
+            for name in &group.dependencies {
                 if name != "python" {
                     out.insert(normalise_pypi_name(name));
                 }
@@ -566,22 +567,30 @@ struct PoetryPyprojectTool {
 
 #[derive(Debug, Default, Deserialize)]
 struct PoetryPyprojectPoetry {
+    #[serde(default, deserialize_with = "deserialize_dependency_keys")]
+    dependencies: BTreeSet<String>,
     #[serde(default)]
-    dependencies: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
-    #[serde(default)]
-    group: std::collections::BTreeMap<String, PoetryPyprojectGroup>,
+    group: BTreeMap<String, PoetryPyprojectGroup>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PoetryPyprojectGroup {
-    #[serde(default)]
-    dependencies: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    #[serde(default, deserialize_with = "deserialize_dependency_keys")]
+    dependencies: BTreeSet<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PoetryPyprojectProject {
     #[serde(default)]
     dependencies: Vec<String>,
+}
+
+fn deserialize_dependency_keys<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let deps = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+    Ok(deps.into_keys().collect())
 }
 
 // ── PEP 503 name normalisation ────────────────────────────────────────────
