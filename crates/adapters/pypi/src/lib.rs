@@ -462,47 +462,31 @@ fn classify_poetry_source(source: Option<&PoetrySource>) -> Source {
 /// strip both to recover the bare distribution name.
 fn extract_poetry_direct_names(pyproject_raw: &str) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
-    let Ok(value) = pyproject_raw.parse::<toml::Value>() else {
+    let Ok(pyproject) = toml::from_str::<PoetryPyproject>(pyproject_raw) else {
         return out;
     };
 
     // [tool.poetry.dependencies] and [tool.poetry.group.*.dependencies]
-    if let Some(poetry) = value
-        .get("tool")
-        .and_then(|t| t.get("poetry"))
-        .and_then(|p| p.as_table())
-    {
-        if let Some(deps) = poetry.get("dependencies").and_then(|d| d.as_table()) {
-            for name in deps.keys() {
-                if name != "python" {
-                    out.insert(normalise_pypi_name(name));
-                }
+    if let Some(poetry) = pyproject.tool.and_then(|tool| tool.poetry) {
+        for name in poetry.dependencies.keys() {
+            if name != "python" {
+                out.insert(normalise_pypi_name(name));
             }
         }
-        if let Some(groups) = poetry.get("group").and_then(|g| g.as_table()) {
-            for group in groups.values() {
-                if let Some(deps) = group.get("dependencies").and_then(|d| d.as_table()) {
-                    for name in deps.keys() {
-                        if name != "python" {
-                            out.insert(normalise_pypi_name(name));
-                        }
-                    }
+        for group in poetry.group.values() {
+            for name in group.dependencies.keys() {
+                if name != "python" {
+                    out.insert(normalise_pypi_name(name));
                 }
             }
         }
     }
 
     // PEP 621 [project.dependencies] is an array of PEP 508 strings.
-    if let Some(deps) = value
-        .get("project")
-        .and_then(|p| p.get("dependencies"))
-        .and_then(|d| d.as_array())
-    {
-        for entry in deps {
-            if let Some(s) = entry.as_str() {
-                if let Some(name) = pep508_name(s) {
-                    out.insert(normalise_pypi_name(&name));
-                }
+    if let Some(project) = pyproject.project {
+        for entry in project.dependencies {
+            if let Some(name) = pep508_name(&entry) {
+                out.insert(normalise_pypi_name(&name));
             }
         }
     }
@@ -567,6 +551,37 @@ struct PoetrySource {
     reference: Option<String>,
     #[serde(rename = "resolved_reference", default)]
     resolved_reference: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PoetryPyproject {
+    tool: Option<PoetryPyprojectTool>,
+    project: Option<PoetryPyprojectProject>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PoetryPyprojectTool {
+    poetry: Option<PoetryPyprojectPoetry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PoetryPyprojectPoetry {
+    #[serde(default)]
+    dependencies: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    #[serde(default)]
+    group: std::collections::BTreeMap<String, PoetryPyprojectGroup>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PoetryPyprojectGroup {
+    #[serde(default)]
+    dependencies: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PoetryPyprojectProject {
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 // ── PEP 503 name normalisation ────────────────────────────────────────────
