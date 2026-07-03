@@ -11,6 +11,39 @@ minor bumps; breaking changes are called out under a **Breaking** subsection.
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-07-03
+
+### Fixed
+
+* **`requirements.txt` direct-dependency detection now handles
+  pip-compile's multiline `# via` blocks correctly.** The PyPI
+  adapter already treated `# via -r requirements.in` and
+  `# via -c constraints.txt` as "top-level package chosen by the
+  project", but it only remembered a single inline `# via ...`
+  line. Real pip-compile output also emits block form:
+  `# via` followed by one or more `#   ...` lines. We now collect
+  the full block, so packages pulled from a root requirements file
+  keep `direct: true` even when pip-compile also lists other
+  reasons they appear in the solve.
+
+* **`poetry.lock` direct-dependency detection now includes PEP 621
+  optional dependencies.** When the sibling `pyproject.toml` uses
+  modern `[project.optional-dependencies]` extras, those packages
+  are still explicit top-level choices by the project and should
+  not be marked transitive. The Poetry adapter now folds those
+  extras into the direct-dependency set alongside
+  `[tool.poetry.dependencies]`, `[tool.poetry.group.*.dependencies]`,
+  and `[project.dependencies]`.
+
+### Changed
+
+* **`toml` 1.1 migration is now release-safe.** The workspace now
+  enables the crate's `serde` feature explicitly and the Poetry
+  `pyproject.toml` reader uses typed deserialization instead of a
+  looser `toml::Value` walk. This keeps the PyPI adapter building
+  cleanly after the dependency bump and satisfies the stricter
+  clippy checks enforced by the pre-push hook.
+
 ## [0.3.4] — 2026-05-15
 
 ### Added
