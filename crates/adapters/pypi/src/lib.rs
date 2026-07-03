@@ -269,15 +269,35 @@ pub fn parse_requirements_txt(raw: &str) -> Result<Vec<ResolvedDependency>, Adap
     }
 
     // Now walk logical lines. A requirement entry is followed (optionally)
-    // by one or more `# via ...` comment lines that belong to it.
-    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    // by pip-compile's `# via ...` annotation, either inline on one line or
+    // as a small block:
+    //
+    //   # via
+    //   #   -r requirements.in
+    //   #   requests
+    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
+    let mut collecting_via = false;
     for line in logical {
+        if line == "# via" {
+            collecting_via = true;
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# via ") {
             // Attach to the most recent requirement, if any.
             if let Some(last) = entries.last_mut() {
-                last.1 = Some(rest.trim().to_string());
+                last.1.push(rest.trim().to_string());
             }
+            collecting_via = true;
             continue;
+        }
+        if collecting_via {
+            if let Some(rest) = line.strip_prefix("#   ") {
+                if let Some(last) = entries.last_mut() {
+                    last.1.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            collecting_via = false;
         }
         if line.trim_start().starts_with('#') {
             continue;
@@ -286,12 +306,12 @@ pub fn parse_requirements_txt(raw: &str) -> Result<Vec<ResolvedDependency>, Adap
             // pip directive (`-r`, `-c`, `-e`, `--index-url`, ...). Skip.
             continue;
         }
-        entries.push((line, None));
+        entries.push((line, Vec::new()));
     }
 
     let mut out = Vec::with_capacity(entries.len());
     for (line, via) in entries {
-        out.push(parse_requirement_line(&line, via.as_deref())?);
+        out.push(parse_requirement_line(&line, &via)?);
     }
 
     if out.is_empty() {
@@ -304,10 +324,7 @@ pub fn parse_requirements_txt(raw: &str) -> Result<Vec<ResolvedDependency>, Adap
     Ok(out)
 }
 
-fn parse_requirement_line(
-    line: &str,
-    via: Option<&str>,
-) -> Result<ResolvedDependency, AdapterError> {
+fn parse_requirement_line(line: &str, via: &[String]) -> Result<ResolvedDependency, AdapterError> {
     // Split off `--hash=...` tokens.
     let mut tokens = line.split_whitespace();
     let head = tokens
@@ -342,10 +359,13 @@ fn parse_requirement_line(
 
     // pip-compile's `# via -r requirements.in` (or `# via -c ...`) marks a
     // top-level entry pulled directly from the user's input file. Anything
-    // with a different `via` is transitive. No `via` annotation at all
-    // (older pip-compile, or hand-written hash-pinned files) defaults to
-    // direct.
-    let direct = via.is_none_or(|v| v.starts_with("-r ") || v.starts_with("-c ") || v.is_empty());
+    // with only package-name `via` entries is transitive. No `via`
+    // annotation at all (older pip-compile, or hand-written hash-pinned
+    // files) defaults to direct.
+    let direct = via.is_empty()
+        || via
+            .iter()
+            .any(|v| v.starts_with("-r ") || v.starts_with("-c ") || v.is_empty());
 
     Ok(ResolvedDependency {
         ecosystem: Ecosystem::Pypi,
@@ -451,11 +471,12 @@ fn classify_poetry_source(source: Option<&PoetrySource>) -> Source {
 }
 
 /// Extract the union of direct dependency names from a poetry-style
-/// `pyproject.toml`. Reads three locations:
+/// `pyproject.toml`. Reads four locations:
 ///
 /// * `[tool.poetry.dependencies]` (poetry 1.x / 2.x in legacy mode)
 /// * `[tool.poetry.group.<name>.dependencies]` (any group, including dev)
 /// * `[project.dependencies]` (PEP 621, used by poetry 2.x in modern mode)
+/// * `[project.optional-dependencies]` (PEP 621 extras declared by the project)
 ///
 /// The `python` pin is excluded — it's the interpreter constraint, not a
 /// package. Names are PEP 503 normalised. PEP 621 entries may carry
@@ -483,11 +504,19 @@ fn extract_poetry_direct_names(pyproject_raw: &str) -> std::collections::BTreeSe
         }
     }
 
-    // PEP 621 [project.dependencies] is an array of PEP 508 strings.
+    // PEP 621 [project.dependencies] and [project.optional-dependencies]
+    // are arrays of PEP 508 strings.
     if let Some(project) = pyproject.project {
         for entry in project.dependencies {
             if let Some(name) = pep508_name(&entry) {
                 out.insert(normalise_pypi_name(&name));
+            }
+        }
+        for deps in project.optional_dependencies.into_values() {
+            for entry in deps {
+                if let Some(name) = pep508_name(&entry) {
+                    out.insert(normalise_pypi_name(&name));
+                }
             }
         }
     }
@@ -583,6 +612,8 @@ struct PoetryPyprojectGroup {
 struct PoetryPyprojectProject {
     #[serde(default)]
     dependencies: Vec<String>,
+    #[serde(rename = "optional-dependencies", default)]
+    optional_dependencies: BTreeMap<String, Vec<String>>,
 }
 
 fn deserialize_dependency_keys<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
@@ -737,6 +768,26 @@ urllib3==2.2.1 \\
     }
 
     #[test]
+    fn parses_multiline_via_blocks() {
+        let raw = "\
+requests==2.31.0 \\
+    --hash=sha256:abc
+    # via
+    #   -r requirements.in
+    #   local-dev-tools
+urllib3==2.2.1 \\
+    --hash=sha256:def
+    # via
+    #   requests
+";
+        let deps = parse_requirements_txt(raw).unwrap();
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        let urllib3 = deps.iter().find(|d| d.name == "urllib3").unwrap();
+        assert!(requests.direct, "via block with -r ... means top-level");
+        assert!(!urllib3.direct, "package-only via block means transitive");
+    }
+
+    #[test]
     fn rejects_requirements_without_hashes() {
         let raw = "requests==2.31.0\nurllib3==2.2.1\n";
         let err = parse_requirements_txt(raw).unwrap_err();
@@ -887,6 +938,28 @@ dependencies = [
         let urllib3 = deps.iter().find(|d| d.name == "urllib3").unwrap();
         assert!(requests.direct);
         assert!(urllib3.direct, "PEP 508 markers + extras stripped");
+    }
+
+    #[test]
+    fn poetry_lock_pep621_optional_dependencies_count_as_direct() {
+        let pyproject = r#"
+[project]
+name = "demo"
+
+[project.optional-dependencies]
+dev = [
+    "requests>=2.31",
+    "urllib3[secure]>=2 ; python_version >= '3.8'",
+]
+"#;
+        let deps = parse_poetry_lock(POETRY_SIMPLE, Some(pyproject)).unwrap();
+        let requests = deps.iter().find(|d| d.name == "requests").unwrap();
+        let urllib3 = deps.iter().find(|d| d.name == "urllib3").unwrap();
+        assert!(requests.direct);
+        assert!(
+            urllib3.direct,
+            "optional PEP 621 extras are still direct deps"
+        );
     }
 
     #[test]
